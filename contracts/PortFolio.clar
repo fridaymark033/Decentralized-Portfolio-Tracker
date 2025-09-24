@@ -75,6 +75,40 @@
 )
 
 (define-data-var next-tx-id uint u1)
+(define-data-var total-portfolio-value uint u0)
+(define-data-var snapshot-interval uint u144)
+
+(define-map portfolio-snapshots
+  { user: principal, snapshot-id: uint }
+  {
+    timestamp: uint,
+    total-value: uint,
+    cost-basis: uint,
+    pnl: int,
+    pnl-percentage: int
+  }
+)
+
+(define-map user-snapshot-counts
+  { user: principal }
+  { count: uint }
+)
+
+(define-map asset-performance
+  { user: principal, asset-id: (string-ascii 64) }
+  {
+    total-cost: uint,
+    current-value: uint,
+    pnl: int,
+    pnl-percentage: int,
+    last-calculated: uint
+  }
+)
+
+(define-map user-last-snapshot
+  { user: principal }
+  { block-height: uint }
+)
 
 (define-public (initialize-portfolio)
   (let 
@@ -91,6 +125,8 @@
       }
     )
     (map-set user-transaction-counts { user: user } { count: u0 })
+    (map-set user-snapshot-counts { user: user } { count: u0 })
+    (map-set user-last-snapshot { user: user } { block-height: u0 })
     (var-set total-users (+ (var-get total-users) u1))
     (ok true)
   )
@@ -122,6 +158,7 @@
         )
         (record-transaction asset-id "add" amount price)
         (try! (update-portfolio-value user))
+        (try! (update-asset-performance asset-id))
         (ok true)
       )
       (begin
@@ -139,6 +176,7 @@
         (record-transaction asset-id "add" amount price)
         (try! (increment-asset-count user))
         (try! (update-portfolio-value user))
+        (try! (update-asset-performance asset-id))
         (ok true)
       )
     )
@@ -173,6 +211,10 @@
         )
         (record-transaction asset-id "remove" amount (get last-price existing-asset))
         (try! (update-portfolio-value user))
+        (if (is-some (map-get? user-assets { user: user, asset-id: asset-id }))
+          (try! (update-asset-performance asset-id))
+          true
+        )
         (ok true)
       )
       err-not-found
@@ -198,6 +240,7 @@
           }
         )
         (try! (update-portfolio-value user))
+        (try! (update-asset-performance asset-id))
         (ok true)
       )
       err-not-found
@@ -316,7 +359,24 @@
 )
 
 (define-private (calculate-total-value (user principal))
-  u0
+  (default-to u0 (get total-value (map-get? user-portfolios { user: user })))
+)
+
+(define-private (calculate-cost-basis (user principal))
+  (let 
+    ((result (fold calculate-single-asset-cost 
+                  (list "STX" "BTC" "ETH" "USDC" "ALEX" "DIKO" "XBTC" "sBTC" "WELSH" "CHA") 
+                  { user: user, total: u0 })))
+    (get total result)
+  )
+)
+
+(define-private (calculate-single-asset-cost (asset-id (string-ascii 64)) (acc { user: principal, total: uint }))
+  (match (map-get? user-assets { user: (get user acc), asset-id: asset-id })
+    asset-data
+    { user: (get user acc), total: (+ (get total acc) (* (get amount asset-data) (get avg-price asset-data))) }
+    acc
+  )
 )
 
 (define-private (has-view-permission (owner principal) (viewer principal))
@@ -371,4 +431,144 @@
 
 (define-read-only (get-asset-metadata (asset-id (string-ascii 64)))
   (map-get? asset-metadata { asset-id: asset-id })
+)
+
+(define-public (create-portfolio-snapshot)
+  (let 
+    ((user tx-sender)
+     (current-height stacks-block-height)
+     (last-snapshot (get block-height (default-to { block-height: u0 } (map-get? user-last-snapshot { user: user }))))
+     (snapshot-count (default-to u0 (get count (map-get? user-snapshot-counts { user: user }))))
+     (current-value (calculate-total-value user))
+     (cost-basis (calculate-cost-basis user))
+     (pnl (- (to-int current-value) (to-int cost-basis)))
+     (pnl-pct (if (> cost-basis u0) (/ (* pnl 10000) (to-int cost-basis)) 0)))
+    
+    (asserts! (is-some (map-get? user-portfolios { user: user })) err-not-found)
+    (asserts! (>= (- current-height last-snapshot) (var-get snapshot-interval)) err-unauthorized)
+    
+    (map-set portfolio-snapshots
+      { user: user, snapshot-id: snapshot-count }
+      {
+        timestamp: current-height,
+        total-value: current-value,
+        cost-basis: cost-basis,
+        pnl: pnl,
+        pnl-percentage: pnl-pct
+      }
+    )
+    
+    (map-set user-snapshot-counts { user: user } { count: (+ snapshot-count u1) })
+    (map-set user-last-snapshot { user: user } { block-height: current-height })
+    (ok snapshot-count)
+  )
+)
+
+(define-public (update-asset-performance (asset-id (string-ascii 64)))
+  (let 
+    ((user tx-sender)
+     (current-height stacks-block-height))
+    
+    (match (map-get? user-assets { user: user, asset-id: asset-id })
+      asset-data
+      (let 
+        ((total-cost (* (get amount asset-data) (get avg-price asset-data)))
+         (current-value (* (get amount asset-data) (get last-price asset-data)))
+         (pnl (- (to-int current-value) (to-int total-cost)))
+         (pnl-pct (if (> total-cost u0) (/ (* pnl 10000) (to-int total-cost)) 0)))
+        
+        (map-set asset-performance
+          { user: user, asset-id: asset-id }
+          {
+            total-cost: total-cost,
+            current-value: current-value,
+            pnl: pnl,
+            pnl-percentage: pnl-pct,
+            last-calculated: current-height
+          }
+        )
+        (ok true)
+      )
+      err-not-found
+    )
+  )
+)
+
+(define-read-only (get-portfolio-performance (user principal))
+  (if (has-view-permission user tx-sender)
+    (let 
+      ((current-value (calculate-total-value user))
+       (cost-basis (calculate-cost-basis user))
+       (pnl (- (to-int current-value) (to-int cost-basis)))
+       (pnl-pct (if (> cost-basis u0) (/ (* pnl 10000) (to-int cost-basis)) 0)))
+      (ok {
+        total-value: current-value,
+        cost-basis: cost-basis,
+        unrealized-pnl: pnl,
+        pnl-percentage: pnl-pct,
+        calculated-at: stacks-block-height
+      })
+    )
+    err-unauthorized
+  )
+)
+
+(define-read-only (get-asset-performance (user principal) (asset-id (string-ascii 64)))
+  (if (has-view-permission user tx-sender)
+    (ok (map-get? asset-performance { user: user, asset-id: asset-id }))
+    err-unauthorized
+  )
+)
+
+(define-read-only (get-portfolio-snapshot (user principal) (snapshot-id uint))
+  (if (has-view-permission user tx-sender)
+    (ok (map-get? portfolio-snapshots { user: user, snapshot-id: snapshot-id }))
+    err-unauthorized
+  )
+)
+
+(define-read-only (get-snapshot-count (user principal))
+  (if (has-view-permission user tx-sender)
+    (ok (default-to u0 (get count (map-get? user-snapshot-counts { user: user }))))
+    err-unauthorized
+  )
+)
+
+(define-read-only (compare-snapshots (user principal) (snapshot-id-1 uint) (snapshot-id-2 uint))
+  (if (has-view-permission user tx-sender)
+    (match (map-get? portfolio-snapshots { user: user, snapshot-id: snapshot-id-1 })
+      snap1
+      (match (map-get? portfolio-snapshots { user: user, snapshot-id: snapshot-id-2 })
+        snap2
+        (let 
+          ((value-change (- (to-int (get total-value snap2)) (to-int (get total-value snap1))))
+           (pnl-change (- (get pnl snap2) (get pnl snap1)))
+           (time-diff (- (get timestamp snap2) (get timestamp snap1))))
+          (ok {
+            period-blocks: time-diff,
+            value-change: value-change,
+            pnl-change: pnl-change,
+            performance-trend: (if (> value-change 0) "up" "down")
+          })
+        )
+        err-not-found
+      )
+      err-not-found
+    )
+    err-unauthorized
+  )
+)
+
+(define-read-only (get-roi (user principal))
+  (if (has-view-permission user tx-sender)
+    (let 
+      ((cost-basis (calculate-cost-basis user))
+       (current-value (calculate-total-value user)))
+      (if (> cost-basis u0)
+        (ok (/ (* (- (to-int current-value) (to-int cost-basis)) 10000) (to-int cost-basis)))
+        (ok 0)
+      )
+    )
+    err-unauthorized
+  )
 )
