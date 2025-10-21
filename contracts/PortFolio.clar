@@ -11,6 +11,7 @@
 (define-constant err-already-exists (err u103))
 (define-constant err-unauthorized (err u104))
 (define-constant err-invalid-asset (err u105))
+(define-constant err-invalid-allocation (err u106))
 
 (define-data-var total-users uint u0)
 (define-data-var platform-fee-rate uint u25)
@@ -108,6 +109,11 @@
 (define-map user-last-snapshot
   { user: principal }
   { block-height: uint }
+)
+
+(define-map target-allocations
+  { user: principal, asset-id: (string-ascii 64) }
+  { percentage: uint }
 )
 
 (define-public (initialize-portfolio)
@@ -569,6 +575,63 @@
         (ok 0)
       )
     )
+    err-unauthorized
+  )
+)
+
+(define-public (set-target-allocation (asset-id (string-ascii 64)) (percentage uint))
+  (let ((user tx-sender))
+    (asserts! (<= percentage u10000) err-invalid-allocation)
+    (asserts! (is-some (map-get? user-assets { user: user, asset-id: asset-id })) err-not-found)
+    (map-set target-allocations
+      { user: user, asset-id: asset-id }
+      { percentage: percentage }
+    )
+    (ok true)
+  )
+)
+
+(define-private (calculate-asset-current-allocation (user principal) (asset-id (string-ascii 64)))
+  (let 
+    ((portfolio (map-get? user-portfolios { user: user }))
+     (asset (map-get? user-assets { user: user, asset-id: asset-id })))
+    (match portfolio
+      port-data
+      (match asset
+        asset-data
+        (if (> (get total-value port-data) u0)
+          (/ (* (* (get amount asset-data) (get last-price asset-data)) u10000) (get total-value port-data))
+          u0
+        )
+        u0
+      )
+      u0
+    )
+  )
+)
+
+(define-read-only (get-rebalancing-suggestions (user principal) (threshold uint))
+  (if (has-view-permission user tx-sender)
+    (let 
+      ((portfolio (map-get? user-portfolios { user: user })))
+      (match portfolio
+        port-data
+        (ok {
+          portfolio-total: (get total-value port-data),
+          asset-count: (get asset-count port-data),
+          threshold-used: threshold,
+          timestamp: stacks-block-height
+        })
+        err-not-found
+      )
+    )
+    err-unauthorized
+  )
+)
+
+(define-read-only (get-target-allocation (user principal) (asset-id (string-ascii 64)))
+  (if (has-view-permission user tx-sender)
+    (ok (map-get? target-allocations { user: user, asset-id: asset-id }))
     err-unauthorized
   )
 )
